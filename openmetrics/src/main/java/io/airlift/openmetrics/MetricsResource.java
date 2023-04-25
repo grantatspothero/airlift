@@ -51,6 +51,7 @@ import java.util.Set;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
+import static com.google.common.collect.ImmutableMap.toImmutableMap;
 import static java.util.Objects.requireNonNull;
 
 @Path("/metrics")
@@ -159,6 +160,8 @@ public class MetricsResource
         StringBuilder metricNameBuilder = new StringBuilder("JMX_")
                 .append(objectName.getDomain());
 
+        // TODO name and type are not necessary here since they're included in labels
+        // but to remove them, lookup by name needs to support labels too, or does it?
         if (objectName.getKeyProperty("name") != null) {
             metricNameBuilder.append(NAME_SEPARATOR)
                     .append(objectName.getKeyProperty("name"));
@@ -187,7 +190,7 @@ public class MetricsResource
             try {
                 String attributeName = attributeNameFromMetricName(jmxMetricName);
                 return objectNamesFromMetricName(jmxMetricName).stream()
-                        .map(objectName -> getMetric(objectName, attributeName, jmxMetricName, ""))
+                        .map(objectName -> getMetric(objectName, attributeName, jmxMetricName, getLabels(objectName), ""))
                         .flatMap(Optional::stream)
                         .map(Metric::getMetricExposition)
                         .findFirst();
@@ -206,7 +209,7 @@ public class MetricsResource
         }
     }
 
-    private Optional<Metric> getMetric(ObjectName objectName, String attributeName, String metricName, String description)
+    private Optional<Metric> getMetric(ObjectName objectName, String attributeName, String metricName, Map<String, String> labels, String description)
     {
         try {
             Object attributeValue = mbeanServer.getAttribute(objectName, attributeName);
@@ -224,6 +227,7 @@ public class MetricsResource
 
     private String inferAttributesForObjectName(ObjectName objectName)
     {
+        Map<String, String> labels = getLabels(objectName);
         StringBuilder expositions = new StringBuilder();
         try {
             MBeanInfo mbeanInfo = mbeanServer.getMBeanInfo(objectName);
@@ -231,7 +235,7 @@ public class MetricsResource
                 String attributeName = mBeanAttributeInfo.getName();
                 String description = mBeanAttributeInfo.getDescription();
                 try {
-                    getMetric(objectName, attributeName, mBeanNameToMetricName(objectName, attributeName), description)
+                    getMetric(objectName, attributeName, mBeanNameToMetricName(objectName, attributeName), labels, description)
                             .ifPresent(value -> expositions.append(value.getMetricExposition()));
                 }
                 catch (RuntimeException e) {
@@ -251,7 +255,16 @@ public class MetricsResource
         return NON_ALLOWED_LABEL_CHARACTERS.collapseFrom(name, '_');
     }
 
-    private List<Metric> getMetricsRecursively(String prefix, ManagedClass managedClass)
+    private static Map<String, String> getLabels(ObjectName objectName)
+    {
+        Map<String, String> labels = Stream.concat(
+                        objectName.getKeyPropertyList().entrySet().stream().sorted(Map.Entry.comparingByKey()),
+                        Stream.of(Map.entry("domain", objectName.getDomain())))
+                .collect(toImmutableMap(Map.Entry::getKey, Map.Entry::getValue));
+        return labels;
+    }
+
+    private List<Metric> getMetricsRecursively(String prefix, Map<String, String> labels, ManagedClass managedClass)
     {
         String metricName = sanitizeMetricName(prefix);
 
@@ -264,13 +277,13 @@ public class MetricsResource
 
                 if (managedClass.getChildren().get(attributeName) instanceof ManagedClass child) {
                     // The managed class is directly translatable to an openmetrics type, don't recurse any further
-                    Optional<Metric> metricFromTarget = getMetricFromTarget(child, metricAndAttribute, attributeDescription);
+                    Optional<Metric> metricFromTarget = getMetricFromTarget(child, metricAndAttribute, labels, attributeDescription);
                     if (metricFromTarget.isPresent()) {
                         metrics.add(metricFromTarget.orElseThrow());
                     }
                     else {
                         // Recurse this nested child
-                        metrics.addAll(getMetricsRecursively(metricAndAttribute, child));
+                        metrics.addAll(getMetricsRecursively(metricAndAttribute, labels, child));
                     }
                 }
                 else {
@@ -292,7 +305,7 @@ public class MetricsResource
         return metrics.build();
     }
 
-    private Optional<Metric> getMetricFromTarget(ManagedClass managedClass, String metricName, String description)
+    private Optional<Metric> getMetricFromTarget(ManagedClass managedClass, String metricName, Map<String, String> labels, String description)
     {
         Object target;
         try {
@@ -327,7 +340,19 @@ public class MetricsResource
         Map<String, ManagedClass> managedClasses = this.mbeanExporter.getManagedClasses();
 
         return managedClasses.keySet().stream()
-                .map(objectName -> getMetricsRecursively(objectName, managedClasses.get(objectName)))
+                .map(name -> {
+                    ObjectName objectName;
+                    try {
+                        objectName = new ObjectName(name);
+                    }
+                    catch (MalformedObjectNameException e) {
+                        // objectName is a string representation of an existing ObjectName
+                        throw new RuntimeException(e);
+                    }
+                    Map<String, String> allLabels = Stream.concat(getLabels(objectName).entrySet().stream(), labels.entrySet().stream())
+                            .collect(toImmutableMap(Map.Entry::getKey, Map.Entry::getValue));
+                    return getMetricsRecursively(objectName.getDomain(), allLabels, managedClasses.get(name));
+                })
                 .flatMap(List::stream);
     }
 
