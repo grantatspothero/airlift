@@ -72,17 +72,40 @@ public class BoundedExecutor
         }
     }
 
+    /**
+     * Drains the queue and runs each task one at a time.
+     * Interrupt handling is similar to MoreExecutors#newSequentialExecutor with one key difference:
+     * newSequentialExecutor restores any interrupt observed at any point while draining the queue,
+     * which can propagate one task's own interrupt (e.g. a canceled FutureTask) onward to whatever
+     * runs next on that thread. BoundedExecutor only restores interrupt status that was already present
+     * before this batch began; an interrupt arising from a task during the batch is cleared and not
+     * propagated.
+     * For a BoundedExecutor wrapping a plain ThreadPoolExecutor, this distinction rarely matters:
+     * ThreadPoolExecutor clears interrupt status before each task it runs, so any residual
+     * flag left behind would be erased before it could be observed anyway.
+     */
     private void drainQueue()
     {
         // INVARIANT: queue has at least one task available when this method is called
-        do {
-            try {
-                queue.poll().run();
+        boolean interruptedAtStart = Thread.interrupted();
+        try {
+            do {
+                try {
+                    queue.poll().run();
+                }
+                catch (Throwable e) {
+                    log.error(e, "Task failed");
+                }
+                finally {
+                    Thread.interrupted();
+                }
             }
-            catch (Throwable e) {
-                log.error(e, "Task failed");
+            while (queueSize.getAndDecrement() > maxThreads);
+        }
+        finally {
+            if (interruptedAtStart) {
+                Thread.currentThread().interrupt();
             }
         }
-        while (queueSize.getAndDecrement() > maxThreads);
     }
 }
