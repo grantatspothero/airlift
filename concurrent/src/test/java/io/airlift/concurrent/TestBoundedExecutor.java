@@ -14,9 +14,11 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 import static com.google.common.util.concurrent.Uninterruptibles.awaitUninterruptibly;
@@ -236,6 +238,114 @@ public class TestBoundedExecutor
         });
 
         assertThat(order).containsExactly(1, 3, 2);
+    }
+
+    /**
+     * An {@link Error} thrown by a task is non-recoverable and must propagate rather than being swallowed.
+     */
+    @Test
+    public void testErrorFromTaskPropagates()
+    {
+        AtomicReference<Throwable> uncaughtException = new AtomicReference<>();
+        CountDownLatch taskFailed = new CountDownLatch(1);
+        ThreadFactory threadFactory = runnable -> {
+            Thread thread = new Thread(runnable);
+            thread.setUncaughtExceptionHandler((_, e) -> {
+                uncaughtException.set(e);
+                taskFailed.countDown();
+            });
+            return thread;
+        };
+
+        try (ExecutorService singleThread = Executors.newSingleThreadExecutor(threadFactory)) {
+            BoundedExecutor boundedExecutor = new BoundedExecutor(singleThread, 1);
+
+            boundedExecutor.execute(() -> {
+                throw new StackOverflowError("boom");
+            });
+
+            assertThat(awaitUninterruptibly(taskFailed, 1, TimeUnit.MINUTES)).isTrue();
+            assertThat(uncaughtException.get())
+                    .isInstanceOf(StackOverflowError.class)
+                    .hasMessage("boom");
+        }
+    }
+
+    /**
+     * With a directExecutor the {@link Error} is propagated to the calling thread.
+     */
+    @Test
+    public void testDirectExecutorErrorFromTaskPropagates()
+    {
+        BoundedExecutor boundedExecutor = new BoundedExecutor(directExecutor(), 1);
+        assertThatThrownBy(() -> boundedExecutor.execute(() -> {
+            throw new StackOverflowError("boom");
+        }))
+                .isInstanceOf(StackOverflowError.class)
+                .hasMessage("boom");
+
+        // The Error came from a task, not from coreExecutor so BoundedExecutor must still accept and run further work.
+        AtomicBoolean ranAfterError = new AtomicBoolean();
+        boundedExecutor.execute(() -> ranAfterError.set(true));
+        assertThat(ranAfterError.get()).isTrue();
+    }
+
+    /**
+     * With a directExecutor, an Error from a reentrantly queued task is rethrown synchronously through
+     * the replacement {@code drainQueue()} dispatch nested inside the original task's own Error handling.
+     */
+    @Test
+    public void testDirectExecutorErrorFromReentrantTaskDoesNotFailExecutor()
+    {
+        BoundedExecutor boundedExecutor = new BoundedExecutor(directExecutor(), 1);
+
+        assertThatThrownBy(() -> boundedExecutor.execute(() -> {
+            boundedExecutor.execute(() -> {
+                throw new StackOverflowError("boom2");
+            });
+            throw new StackOverflowError("boom1");
+        }))
+                .isInstanceOf(StackOverflowError.class)
+                .hasMessage("boom1")
+                .satisfies(e -> assertThat(e.getSuppressed()).hasSize(1))
+                .satisfies(e -> assertThat(e.getSuppressed()[0])
+                        .isInstanceOf(StackOverflowError.class)
+                        .hasMessage("boom2"));
+
+        AtomicBoolean ranAfterError = new AtomicBoolean();
+        boundedExecutor.execute(() -> ranAfterError.set(true));
+        assertThat(ranAfterError.get()).isTrue();
+    }
+
+    /**
+     * When a task throws an {@link Error}, the draining thread terminates, but any remaining queued
+     * tasks must still be drained (by a re-dispatched draining task) rather than stranded.
+     */
+    @Test
+    public void testRemainingTasksStillRunAfterTaskError()
+    {
+        try (ExecutorService singleThread = Executors.newSingleThreadExecutor()) {
+            BoundedExecutor boundedExecutor = new BoundedExecutor(singleThread, 1);
+
+            CountDownLatch firstStarted = new CountDownLatch(1);
+            AtomicBoolean release = new AtomicBoolean();
+            CountDownLatch secondRan = new CountDownLatch(1);
+
+            boundedExecutor.execute(() -> {
+                firstStarted.countDown();
+                // Busy wait until the second task is enqueued into the same batch, then fail hard.
+                while (!release.get()) {
+                    Thread.onSpinWait();
+                }
+                throw new StackOverflowError("boom");
+            });
+
+            assertThat(awaitUninterruptibly(firstStarted, 1, TimeUnit.MINUTES)).isTrue();
+            boundedExecutor.execute(secondRan::countDown);
+            release.set(true);
+
+            assertThat(awaitUninterruptibly(secondRan, 1, TimeUnit.MINUTES)).isTrue();
+        }
     }
 
     @SuppressWarnings("SameParameterValue")
